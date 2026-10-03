@@ -1,10 +1,10 @@
-# SkillManager 多平台构建 / 发布流水线
+# SkillManager 三端构建 / 发布流水线
 #
-# 触发方式
-#   推送 v* 标签  → 三端并行构建，创建 GitHub Release 并自动上传全部安装包
-#   手动触发      → 只构建，产物在本次 Actions 运行页面的 Artifacts 里下载（不创建 Release）
+# 触发
+#   push v* 标签      三端并行构建，创建 GitHub Release 并上传全部安装包
+#   workflow_dispatch 只构建，产物从本次运行的 Artifacts 下载（不创建 Release）
 #
-# 产出物
+# 产物
 #   macOS   SkillManager_<版本>_aarch64.dmg        Apple Silicon
 #           SkillManager_<版本>_x64.dmg            Intel
 #   Windows SkillManager_<版本>_x64-setup.exe      NSIS 安装器
@@ -12,57 +12,63 @@
 #   Linux   SkillManager_<版本>_amd64.AppImage
 #           SkillManager_<版本>_amd64.deb
 #
-# 发版步骤：同步 tauri.conf.json / Cargo.toml / package.json 三处版本号 → 提交
-#          → git tag v<版本> → git push origin master --tags
+# 发版：同步 tauri.conf.json、Cargo.toml、package.json 三处版本号后提交，
+#       再 git tag v<版本> && git push origin master --tags
 
 name: Build
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+
 jobs:
   build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.platform }}
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          # macos-13（Intel runner）已被 GitHub 下线，x64 版本改为在 Apple Silicon
-          # runner 上用 --target x86_64-apple-darwin 交叉编译，产物是原生 Intel 二进制。
-          - name: macOS arm64 · dmg
-            platform: macos-15
+          # macos-13（Intel runner）已被 GitHub 下线，x64 改在 Apple Silicon
+          # runner 上交叉编译，产物仍是原生 Intel 二进制
+          - label: macOS arm64 · dmg
+            os: macos-15
             target: aarch64-apple-darwin
-            args: --target aarch64-apple-darwin --bundles dmg
+            bundles: dmg
 
-          - name: macOS x64 · dmg
-            platform: macos-15
+          - label: macOS x64 · dmg
+            os: macos-15
             target: x86_64-apple-darwin
-            args: --target x86_64-apple-darwin --bundles dmg
+            bundles: dmg
 
-          - name: Windows x64 · nsis + 免安装
-            platform: windows-latest
-            target: ""
-            args: --bundles nsis
+          - label: Windows x64 · nsis + 免安装
+            os: windows-latest
+            bundles: nsis
+            portable: true
 
-          # 用 22.04 而非 24.04：glibc 版本更低，AppImage / deb 兼容的发行版更多
-          - name: Linux x64 · AppImage + deb
-            platform: ubuntu-22.04
-            target: ""
-            args: --bundles appimage,deb
+          # 22.04 而非 24.04：glibc 更旧，AppImage / deb 能覆盖更多发行版
+          - label: Linux x64 · AppImage + deb
+            os: ubuntu-22.04
+            bundles: appimage,deb
 
     steps:
       - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
@@ -72,13 +78,13 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: "./src-tauri -> target"
-          key: ${{ matrix.platform }}-${{ matrix.target }}
+          key: ${{ matrix.os }}-${{ matrix.target }}
 
       - name: 安装前端依赖
         run: npm ci
 
       - name: 安装 Linux 系统依赖
-        if: startsWith(matrix.platform, 'ubuntu')
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -91,62 +97,60 @@ jobs:
             xdg-utils \
             libfuse2
 
-      # tauri.conf.json 未配 beforeBuildCommand，dist/ 需要自己先构建出来，
+      # tauri.conf.json 未配 beforeBuildCommand，dist/ 需自己先构建出来，
       # 否则 tauri build 会报 "Unable to find your web assets"
       - name: 构建前端
         run: npm run build
 
-      # tagName / releaseName 留空时该 action 只构建、不碰 Release
-      - name: 构建（打 tag 时同时发布 Release）
+      # tagName / releaseName 为空时该 action 只构建、不碰 Release
+      - name: 构建并打包
         id: tauri
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
-          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('SkillManager {0}', github.ref_name) || '' }}
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: ${{ github.ref_type == 'tag' && format('SkillManager {0}', github.ref_name) || '' }}
           releaseDraft: false
           prerelease: false
           generateReleaseNotes: true
-          # 项目没接 tauri-plugin-updater，不生成 latest.json
           uploadUpdaterJson: false
           uploadWorkflowArtifacts: true
           workflowArtifactNamePattern: "[name]-[version]-[platform]-[arch]-[bundle]"
-          args: ${{ matrix.args }}
+          args: --bundles ${{ matrix.bundles }} ${{ matrix.target && format('--target {0}', matrix.target) }}
 
-      # Tauri 没有内置免安装打包，直接取编译出的主程序（前端资源已内嵌其中）压缩成 zip
-      - name: 生成 Windows 免安装版
-        if: matrix.platform == 'windows-latest'
+      # Tauri 没有内置免安装打包：编译出的 exe 已内嵌前端资源，压成 zip 即可
+      - name: 生成免安装版
+        if: matrix.portable
         shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.tauri.outputs.appVersion }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $releaseDir = "src-tauri/target/release"
+          $dir = "src-tauri/target/release"
           $exe = @("SkillManager.exe", "skill-manager.exe") |
-            ForEach-Object { Join-Path $releaseDir $_ } |
+            ForEach-Object { Join-Path $dir $_ } |
             Where-Object { Test-Path $_ } |
             Select-Object -First 1
 
           if (-not $exe) {
-            Write-Host "$releaseDir 下实际存在的 .exe："
-            Get-ChildItem $releaseDir -Filter *.exe | Select-Object -ExpandProperty Name
-            throw "未找到主程序可执行文件"
+            $found = (Get-ChildItem $dir -Filter *.exe).Name -join ", "
+            throw "未找到主程序可执行文件，$dir 下只有：$found"
           }
 
-          New-Item -ItemType Directory -Force -Path portable | Out-Null
-          Copy-Item $exe portable/SkillManager.exe
-          Compress-Archive -Path portable/SkillManager.exe `
-            -DestinationPath "SkillManager_${{ steps.tauri.outputs.appVersion }}_x64_portable.zip" -Force
+          $zip = "SkillManager_${env:APP_VERSION}_x64_portable.zip"
+          New-Item -ItemType Directory -Force portable | Out-Null
+          Copy-Item -Path $exe -Destination portable/SkillManager.exe
+          Compress-Archive -Path portable/SkillManager.exe -DestinationPath $zip -Force
+          Write-Host "已生成 $zip"
 
-      - name: 上传免安装版到 Release
-        if: matrix.platform == 'windows-latest' && startsWith(github.ref, 'refs/tags/')
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload "${{ github.ref_name }}" `
-            "SkillManager_${{ steps.tauri.outputs.appVersion }}_x64_portable.zip" --clobber
+          if ("${{ github.ref_type }}" -eq "tag") {
+            gh release upload "${{ github.ref_name }}" $zip --clobber
+            Write-Host "已上传到 Release ${{ github.ref_name }}"
+          }
 
       - name: 上传免安装版为 Artifact
-        if: matrix.platform == 'windows-latest'
+        if: matrix.portable
         uses: actions/upload-artifact@v7
         with:
           name: SkillManager-windows-x64-portable
