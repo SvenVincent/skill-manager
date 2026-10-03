@@ -1,0 +1,146 @@
+# SkillManager 多平台构建 / 发布流水线
+#
+# 触发方式
+#   推送 v* 标签  → 三端并行构建，创建 GitHub Release 并自动上传全部安装包
+#   手动触发      → 只构建，产物在本次 Actions 运行页面的 Artifacts 里下载（不创建 Release）
+#
+# 产出物
+#   macOS   SkillManager_<版本>_aarch64.dmg        Apple Silicon
+#           SkillManager_<版本>_x64.dmg            Intel
+#   Windows SkillManager_<版本>_x64-setup.exe      NSIS 安装器
+#           SkillManager_<版本>_x64_portable.zip   免安装绿色版
+#   Linux   SkillManager_<版本>_amd64.AppImage
+#           SkillManager_<版本>_amd64.deb
+#
+# 发版步骤：同步 tauri.conf.json / Cargo.toml / package.json 三处版本号 → 提交
+#          → git tag v<版本> → git push origin master --tags
+
+name: Build
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-13（Intel runner）已被 GitHub 下线，x64 版本改为在 Apple Silicon
+          # runner 上用 --target x86_64-apple-darwin 交叉编译，产物是原生 Intel 二进制。
+          - name: macOS arm64 · dmg
+            platform: macos-15
+            target: aarch64-apple-darwin
+            args: --target aarch64-apple-darwin --bundles dmg
+
+          - name: macOS x64 · dmg
+            platform: macos-15
+            target: x86_64-apple-darwin
+            args: --target x86_64-apple-darwin --bundles dmg
+
+          - name: Windows x64 · nsis + 免安装
+            platform: windows-latest
+            target: ""
+            args: --bundles nsis
+
+          # 用 22.04 而非 24.04：glibc 版本更低，AppImage / deb 兼容的发行版更多
+          - name: Linux x64 · AppImage + deb
+            platform: ubuntu-22.04
+            target: ""
+            args: --bundles appimage,deb
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+          key: ${{ matrix.platform }}-${{ matrix.target }}
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 安装 Linux 系统依赖
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            xdg-utils \
+            libfuse2
+
+      # tagName / releaseName 留空时该 action 只构建、不碰 Release
+      - name: 构建（打 tag 时同时发布 Release）
+        id: tauri
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+          releaseName: ${{ startsWith(github.ref, 'refs/tags/') && format('SkillManager {0}', github.ref_name) || '' }}
+          releaseDraft: false
+          prerelease: false
+          generateReleaseNotes: true
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: "[name]-[version]-[platform]-[arch]-[bundle]"
+          args: ${{ matrix.args }}
+
+      # Tauri 没有内置免安装打包，直接取编译出的主程序（前端资源已内嵌其中）压缩成 zip
+      - name: 生成 Windows 免安装版
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $releaseDir = "src-tauri/target/release"
+          $exe = @("SkillManager.exe", "skill-manager.exe") |
+            ForEach-Object { Join-Path $releaseDir $_ } |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            Write-Host "$releaseDir 下实际存在的 .exe："
+            Get-ChildItem $releaseDir -Filter *.exe | Select-Object -ExpandProperty Name
+            throw "未找到主程序可执行文件"
+          }
+
+          New-Item -ItemType Directory -Force -Path portable | Out-Null
+          Copy-Item $exe portable/SkillManager.exe
+          Compress-Archive -Path portable/SkillManager.exe `
+            -DestinationPath "SkillManager_${{ steps.tauri.outputs.appVersion }}_x64_portable.zip" -Force
+
+      - name: 上传免安装版到 Release
+        if: matrix.platform == 'windows-latest' && startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" `
+            "SkillManager_${{ steps.tauri.outputs.appVersion }}_x64_portable.zip" --clobber
+
+      - name: 上传免安装版为 Artifact
+        if: matrix.platform == 'windows-latest'
+        uses: actions/upload-artifact@v7
+        with:
+          name: SkillManager-windows-x64-portable
+          path: SkillManager_*_x64_portable.zip
