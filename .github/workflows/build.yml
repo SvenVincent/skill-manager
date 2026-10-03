@@ -108,6 +108,8 @@ jobs:
           releaseDraft: false
           prerelease: false
           generateReleaseNotes: true
+          # 项目没接 tauri-plugin-updater，不生成 latest.json
+          uploadUpdaterJson: false
           uploadWorkflowArtifacts: true
           workflowArtifactNamePattern: "[name]-[version]-[platform]-[arch]-[bundle]"
           args: ${{ matrix.args }}
