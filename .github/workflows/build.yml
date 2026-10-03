@@ -91,6 +91,11 @@ jobs:
             xdg-utils \
             libfuse2
 
+      # tauri.conf.json 未配 beforeBuildCommand，dist/ 需要自己先构建出来，
+      # 否则 tauri build 会报 "Unable to find your web assets"
+      - name: 构建前端
+        run: npm run build
+
       # tagName / releaseName 留空时该 action 只构建、不碰 Release
       - name: 构建（打 tag 时同时发布 Release）
         id: tauri
