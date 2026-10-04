@@ -1,8 +1,13 @@
 # SkillManager 三端构建 / 发布流水线
 #
+# 阶段
+#   解析版本号    读出 tauri.conf.json 的版本，校验 tag 与之一致
+#   桌面端矩阵    四端并行构建，各自上传 Artifact（不碰 Release）
+#   发布 Release  汇总全部 Artifact，一次性创建 Release 并挂上所有安装包
+#
 # 触发
-#   push v* 标签      三端并行构建，创建 GitHub Release 并上传全部安装包
-#   workflow_dispatch 只构建，产物从本次运行的 Artifacts 下载（不创建 Release）
+#   push v* 标签      完整跑三个阶段
+#   workflow_dispatch 只跑前两个阶段，产物从本次运行的 Artifacts 下载
 #
 # 产物
 #   macOS   SkillManager_<版本>_aarch64.dmg        Apple Silicon
@@ -33,8 +38,31 @@ env:
   NODE_VERSION: "22"
 
 jobs:
-  build:
+  # ── 1. 解析版本号 ────────────────────────────────────────────────────
+  version:
+    name: 解析版本号
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 读取并校验版本号
+        id: resolve
+        run: |
+          version=$(jq -r .version src-tauri/tauri.conf.json)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tauri.conf.json version = $version"
+
+          # tag 与配置版本号不一致时产物名和 Release 标题会对不上，提前提示
+          if [ "${{ github.ref_type }}" = "tag" ] && [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::warning::tag ${GITHUB_REF_NAME} 与 tauri.conf.json 版本号 $version 不一致"
+          fi
+
+  # ── 2. 四端并行构建 ──────────────────────────────────────────────────
+  desktop:
     name: ${{ matrix.label }}
+    needs: version
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -102,30 +130,21 @@ jobs:
       - name: 构建前端
         run: npm run build
 
-      # tagName / releaseName 为空时该 action 只构建、不碰 Release
+      # 只构建并上传 Artifact，Release 交给 publish 阶段统一处理
       - name: 构建并打包
-        id: tauri
         uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-          releaseName: ${{ github.ref_type == 'tag' && format('SkillManager {0}', github.ref_name) || '' }}
-          releaseDraft: false
-          prerelease: false
-          generateReleaseNotes: true
           uploadUpdaterJson: false
           uploadWorkflowArtifacts: true
           workflowArtifactNamePattern: "[name]-[version]-[platform]-[arch]-[bundle]"
           args: --bundles ${{ matrix.bundles }} ${{ matrix.target && format('--target {0}', matrix.target) }}
 
       # Tauri 没有内置免安装打包：编译出的 exe 已内嵌前端资源，压成 zip 即可
-      - name: 生成免安装版
+      - name: 生成 Windows 免安装版
         if: matrix.portable
         shell: pwsh
         env:
-          APP_VERSION: ${{ steps.tauri.outputs.appVersion }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_VERSION: ${{ needs.version.outputs.version }}
         run: |
           $dir = "src-tauri/target/release"
           $exe = @("SkillManager.exe", "skill-manager.exe") |
@@ -144,14 +163,42 @@ jobs:
           Compress-Archive -Path portable/SkillManager.exe -DestinationPath $zip -Force
           Write-Host "已生成 $zip"
 
-          if ("${{ github.ref_type }}" -eq "tag") {
-            gh release upload "${{ github.ref_name }}" $zip --clobber
-            Write-Host "已上传到 Release ${{ github.ref_name }}"
-          }
-
-      - name: 上传免安装版为 Artifact
+      - name: 上传免安装版
         if: matrix.portable
         uses: actions/upload-artifact@v7
         with:
-          name: SkillManager-windows-x64-portable
+          name: SkillManager-${{ needs.version.outputs.version }}-windows-x64-portable
           path: SkillManager_*_x64_portable.zip
+
+  # ── 3. 汇总发布 ──────────────────────────────────────────────────────
+  publish:
+    name: 发布 GitHub Release
+    needs: [version, desktop]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v7
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: 列出待发布文件
+        run: ls -lh release-assets
+
+      - name: 创建 Release 并上传安装包
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，改为覆盖上传（便于重跑）"
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" \
+              --title "SkillManager $VERSION" \
+              --generate-notes \
+              release-assets/*
+          fi
