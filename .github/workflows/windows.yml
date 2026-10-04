@@ -52,5 +52,6 @@ jobs:
         with:
           uploadUpdaterJson: false
           uploadWorkflowArtifacts: true
-          workflowArtifactNamePattern: "[name]-[version]-[platform]-[arch]-[bundle]"
+          # [setup] 对 NSIS 安装器展开为 -setup，其他类型为空
+          workflowArtifactNamePattern: "[name]-[version]-[platform]-[arch][setup][ext]"
           args: --bundles nsis,msi

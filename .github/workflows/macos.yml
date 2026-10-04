@@ -67,5 +67,5 @@ jobs:
         with:
           uploadUpdaterJson: false
           uploadWorkflowArtifacts: true
-          workflowArtifactNamePattern: "[name]-[version]-[platform]-[arch]-[bundle]"
+          workflowArtifactNamePattern: "[name]-[version]-[platform]-[arch][ext]"
           args: --bundles dmg --target ${{ matrix.target }}
