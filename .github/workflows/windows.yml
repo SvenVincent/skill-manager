@@ -1,0 +1,56 @@
+# Windows 构建 · NSIS 安装器 + MSI 安装包
+#
+# 触发
+#   workflow_dispatch  单独构建 Windows
+#   workflow_call      由 release.yml 调用
+#
+# 产物
+#   SkillManager_<版本>_x64-setup.exe      NSIS 安装器
+#   SkillManager_<版本>_x64_en-US.msi       MSI 安装包
+
+name: Build · Windows
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    name: Windows x64 · nsis + msi
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # vite / eslint 要求 Node ≥ 22.12
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      # tauri.conf.json 未配 beforeBuildCommand，dist/ 需自己先构建出来，
+      # 否则 tauri build 会报 "Unable to find your web assets"
+      - name: 构建前端
+        run: npm run build
+
+      - name: 构建安装包
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          uploadUpdaterJson: false
+          uploadWorkflowArtifacts: true
+          workflowArtifactNamePattern: "[name]-[version]-[platform]-[arch]-[bundle]"
+          args: --bundles nsis,msi

@@ -1,0 +1,81 @@
+# 汇总发布 · 调用三端构建工作流，再把全部安装包挂到同一个 Release
+#
+# 触发
+#   push v* 标签      三端并行构建 + 创建 Release
+#   workflow_dispatch 只构建，产物从本次运行的 Artifacts 下载（不创建 Release）
+#
+# 发版：同步 tauri.conf.json、Cargo.toml、package.json 三处版本号后提交，
+#       再 git tag v<版本> && git push origin master --tags
+
+name: Build · Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS
+    uses: ./.github/workflows/macos.yml
+
+  windows:
+    name: Windows
+    uses: ./.github/workflows/windows.yml
+
+  linux:
+    name: Linux
+    uses: ./.github/workflows/linux.yml
+
+  publish:
+    name: 发布 GitHub Release
+    needs: [macos, windows, linux]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: 读取并校验版本号
+        id: version
+        run: |
+          version=$(jq -r .version src-tauri/tauri.conf.json)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tauri.conf.json version = $version"
+
+          # tag 与配置版本号不一致时产物名和 Release 标题会对不上，提前提示
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::warning::tag ${GITHUB_REF_NAME} 与 tauri.conf.json 版本号 $version 不一致"
+          fi
+
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v7
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: 列出待发布文件
+        run: ls -lh release-assets
+
+      - name: 创建 Release 并上传安装包
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，改为覆盖上传（便于重跑）"
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" \
+              --title "SkillManager $VERSION" \
+              --generate-notes \
+              release-assets/*
+          fi
