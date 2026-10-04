@@ -1,6 +1,6 @@
 [package]
 name = "skill-manager"
-version = "0.1.0"
+version = "0.1.1"
 description = "SkillManager - AI Agent Skill Manager"
 authors = ["you"]
 license = ""

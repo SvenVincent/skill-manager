@@ -28,3 +28,7 @@ src-tauri/Frameworks/
 *.njsproj
 *.sln
 *.sw?
+
+# Tool runtime state
+.mimosa/
+.v2c/
